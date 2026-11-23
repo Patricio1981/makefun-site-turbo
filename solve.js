@@ -1790,7 +1790,9 @@ function jsonifyOps(ops) {
   for (let i = 0; i < ops.length; i++) {
     const o = ops[i];
     if (o.op === 0) {
-      o.text = jsonSliceAlways(o.text);
+      const jt = jsonSliceAlways(o.text);
+      o.text = jt;
+      o.buf = jt.length >= 192 ? Buffer.from(jt, 'utf8') : null;
     } else if (o.op === 8) {
       jsonifyOps(o.thenOps);
       if (o.elseOps !== null) jsonifyOps(o.elseOps);
@@ -1802,21 +1804,91 @@ function jsonifyOps(ops) {
 
 const PLAIN_KEY_RE = /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/;
 let _outBuf = null;
+let _outLen = 0;
+let _outPos = 0;
+let _segStart = 0;
 let _outFd = -1;
 let _writeSync = null;
+let _writevSync = null;
 let _chunk = '';
+const _iovs = [];
 
-function flushChunk() {
+function drainIovsOnly() {
+  if (_outPos > _segStart) {
+    _iovs.push(_outBuf.subarray(_segStart, _outPos));
+    _segStart = _outPos;
+  }
+  const n = _iovs.length;
+  if (n === 0) return;
+  if (_writevSync !== null) {
+    let idx = 0;
+    while (idx < n) {
+      const batch = idx === 0 ? _iovs : _iovs.slice(idx);
+      let written = _writevSync(_outFd, batch);
+      while (idx < n && written >= _iovs[idx].length) {
+        written -= _iovs[idx].length;
+        idx++;
+      }
+      if (written > 0 && idx < n) {
+        _iovs[idx] = _iovs[idx].subarray(written);
+      }
+    }
+  } else {
+    for (let i = 0; i < n; i++) {
+      const b = _iovs[i];
+      let off = 0;
+      const blen = b.length;
+      while (off < blen) off += _writeSync(_outFd, b, off, blen - off);
+    }
+  }
+  _iovs.length = 0;
+  _outPos = 0;
+  _segStart = 0;
+}
+
+function flushChunkToBuf() {
   const clen = _chunk.length;
   if (clen === 0) return;
-  const maxBytes = clen * 3;
-  if (_outBuf === null || maxBytes > _outBuf.length) {
-    _outBuf = Buffer.allocUnsafe(maxBytes > 2097152 ? maxBytes : 2097152);
+  const maxB = clen * 3;
+  if (_outPos + maxB > _outLen) {
+    drainIovsOnly();
+    if (maxB > _outLen) {
+      _outBuf = Buffer.allocUnsafe(maxB > 2097152 ? maxB : 2097152);
+      _outLen = _outBuf.length;
+    }
   }
-  const n = _outBuf.utf8Write(_chunk, 0);
-  let off = 0;
-  while (off < n) off += _writeSync(_outFd, _outBuf, off, n - off);
+  _outPos += _outBuf.utf8Write(_chunk, _outPos);
   _chunk = '';
+}
+
+function flushStrDirect(s) {
+  const slen = s.length;
+  if (slen === 0) return;
+  if (_chunk.length > 0) flushChunkToBuf();
+  const maxB = slen * 3;
+  if (_outPos + maxB > _outLen) {
+    drainIovsOnly();
+    if (maxB > _outLen) {
+      _outBuf = Buffer.allocUnsafe(maxB > 2097152 ? maxB : 2097152);
+      _outLen = _outBuf.length;
+    }
+  }
+  _outPos += _outBuf.utf8Write(s, _outPos);
+}
+
+function emitExtBuf(b) {
+  if (_chunk.length > 0) flushChunkToBuf();
+  if (_outPos > _segStart) {
+    _iovs.push(_outBuf.subarray(_segStart, _outPos));
+    _segStart = _outPos;
+  }
+  _iovs.push(b);
+  if (_iovs.length >= 512) drainIovsOnly();
+}
+
+function flushChunk() {
+  if (_chunk.length > 0) flushChunkToBuf();
+  drainIovsOnly();
 }
 
 function emitEntry(k, vs, first, knownPlain) {
@@ -1825,7 +1897,169 @@ function emitEntry(k, vs, first, knownPlain) {
   } else {
     _chunk += (first ? '' : ',') + JSON.stringify(k) + ':"' + vs + '"';
   }
-  if (_chunk.length >= 262144) flushChunk();
+  if (_chunk.length >= 24576) flushChunkToBuf();
+}
+
+function emitEntryOps(k, ops, stack, first, knownPlain) {
+  if (knownPlain || PLAIN_KEY_RE.test(k)) {
+    _chunk += (first ? '"' : ',"') + k + '":"';
+  } else {
+    _chunk += (first ? '' : ',') + JSON.stringify(k) + ':"';
+  }
+  emitOpsDirect(ops, stack);
+  _chunk += '"';
+  if (_chunk.length >= 24576) flushChunkToBuf();
+}
+
+function emitOpsDirect(ops, stack) {
+  const len = ops.length;
+  for (let i = 0; i < len; i++) {
+    const o = ops[i];
+    switch (o.op) {
+      case 0:
+        if (o.buf !== null) emitExtBuf(o.buf);
+        else _chunk += o.text;
+        break;
+      case 1:
+        _chunk += renderVarValueExec(stack[o.slot]);
+        break;
+      case 2: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          _chunk += renderVarValueExec(obj[o.k1]);
+        }
+        break;
+      }
+      case 3: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          const v1 = obj[o.k1];
+          if (v1 !== null && typeof v1 === 'object' && Object.hasOwn(v1, o.k2)) {
+            _chunk += renderVarValueExec(v1[o.k2]);
+          }
+        }
+        break;
+      }
+      case 4:
+        _chunk += renderVarValueExec(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
+        break;
+      case 5:
+        _chunk += renderRawValueExec(stack[o.slot]);
+        break;
+      case 6: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object') {
+          const v = obj[o.k1];
+          if (typeof v === 'string') {
+            if (v.length >= 512) flushStrDirect(v);
+            else _chunk += v;
+          } else if (typeof v === 'number') _chunk += v;
+          else if (typeof v === 'boolean') _chunk += v ? 'true' : 'false';
+          else if (Array.isArray(v)) _chunk += textOf(v);
+        }
+        break;
+      }
+      case 10: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          const v1 = obj[o.k1];
+          if (v1 !== null && typeof v1 === 'object') {
+            const v = v1[o.k2];
+            if (typeof v === 'string') _chunk += v;
+            else if (typeof v === 'number') _chunk += v;
+            else if (typeof v === 'boolean') _chunk += v ? 'true' : 'false';
+            else if (Array.isArray(v)) _chunk += textOf(v);
+          }
+        }
+        break;
+      }
+      case 11: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          _chunk += renderRawValueExec(obj[o.k1]);
+        }
+        break;
+      }
+      case 12: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          const v1 = obj[o.k1];
+          if (v1 !== null && typeof v1 === 'object' && Object.hasOwn(v1, o.k2)) {
+            _chunk += renderRawValueExec(v1[o.k2]);
+          }
+        }
+        break;
+      }
+      case 7:
+        _chunk += renderRawValueExec(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
+        break;
+      case 8: {
+        let v;
+        if (o.plen === 2) {
+          const obj = stack[o.slot];
+          v = (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) ? obj[o.k1] : undefined;
+        } else {
+          v = evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2);
+        }
+        const ok = Array.isArray(v) ? v.length > 0 : (v !== undefined && v !== null && v !== false && v !== '' && v !== 0);
+        const branch = ok !== o.not ? o.thenOps : o.elseOps;
+        if (branch !== null) emitOpsDirect(branch, stack);
+        break;
+      }
+      case 9: {
+        let xs;
+        if (o.plen === 2) {
+          const obj = stack[o.slot];
+          xs = (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) ? obj[o.k1] : undefined;
+        } else {
+          xs = evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2);
+        }
+        if (!Array.isArray(xs)) break;
+        const xlen = xs.length;
+        if (xlen === 0) break;
+        const itemSlot = o.itemSlot;
+        const bodyOps = o.bodyOps;
+        const cache = o.itemCache;
+        if (cache !== null) {
+          for (let k = 0; k < xlen; k++) {
+            const item = xs[k];
+            let v = cache.get(item);
+            if (v === undefined) {
+              stack[itemSlot] = item;
+              const s = execOps(bodyOps, stack);
+              if (s.length >= 128) {
+                v = Buffer.from(s, 'utf8');
+              } else {
+                FLAT_RE.test(s);
+                v = s;
+              }
+              cache.set(item, v);
+            }
+            if (typeof v === 'string') _chunk += v;
+            else emitExtBuf(v);
+          }
+        } else if (o.needsLoop) {
+          const loopSlot = o.loopSlot;
+          const lastIdx = xlen - 1;
+          const loopObj = { index: 1, first: true, last: false, length: xlen };
+          stack[loopSlot] = loopObj;
+          for (let k = 0; k < xlen; k++) {
+            stack[itemSlot] = xs[k];
+            loopObj.index = k + 1;
+            loopObj.first = k === 0;
+            loopObj.last = k === lastIdx;
+            emitOpsDirect(bodyOps, stack);
+          }
+        } else {
+          for (let k = 0; k < xlen; k++) {
+            stack[itemSlot] = xs[k];
+            emitOpsDirect(bodyOps, stack);
+          }
+        }
+        break;
+      }
+    }
+  }
 }
 
 const ALWAYS_SAFE_HTML_KEYS = new Set([
@@ -1982,7 +2216,7 @@ function execOps(ops, stack) {
               FLAT_RE.test(s);
               cache.set(item, s);
             }
-            out += s;
+            out += typeof s === 'string' ? s : s.toString('utf8');
           }
         } else if (o.needsLoop) {
           const loopSlot = o.loopSlot;
@@ -2745,7 +2979,7 @@ export function run(input, jsonMode = false) {
       stack[0] = pageObj;
       const outPath = s.outDir + '/index.html';
       if (builtPaths !== null) builtPaths.add(outPath);
-      emitEntry(outPath, execOps(compiled.ops, stack), firstEntry, baseSafe);
+      emitEntryOps(outPath, compiled.ops, stack, firstEntry, baseSafe);
       firstEntry = false;
       s.html = '';
     }
@@ -2778,7 +3012,7 @@ export function run(input, jsonMode = false) {
         stack[1] = pagerObj;
         const outPath = k === 1 ? 'index.html' : 'page/' + k + '/index.html';
         if (builtPaths !== null) builtPaths.add(outPath);
-        emitEntry(outPath, execOps(compiledIndex.ops, stack), firstEntry, true);
+        emitEntryOps(outPath, compiledIndex.ops, stack, firstEntry, true);
         firstEntry = false;
       }
     }
@@ -2810,7 +3044,7 @@ export function run(input, jsonMode = false) {
         stack[0] = tagObj;
         const outPath = 'tags/' + t.slug + '/index.html';
         if (builtPaths !== null) builtPaths.add(outPath);
-        emitEntry(outPath, execOps(compiledTag.ops, stack), firstEntry, true);
+        emitEntryOps(outPath, compiledTag.ops, stack, firstEntry, true);
         firstEntry = false;
       }
     }
@@ -2829,7 +3063,7 @@ export function run(input, jsonMode = false) {
       );
       const outPath = 'tags/index.html';
       if (builtPaths !== null) builtPaths.add(outPath);
-      emitEntry(outPath, execOps(compiledTags.ops, stack), firstEntry, true);
+      emitEntryOps(outPath, compiledTags.ops, stack, firstEntry, true);
       firstEntry = false;
     }
 
@@ -3014,10 +3248,16 @@ export function run(input, jsonMode = false) {
   return output;
 }
 
-export function runBatchToFd(cases, fd, writeSyncFn, reuseBuf) {
-  if (reuseBuf && reuseBuf.length >= 1048576) _outBuf = reuseBuf;
+export function runBatchToFd(cases, fd, writeSyncFn, reuseBuf, writevSyncFn) {
+  if (reuseBuf && reuseBuf.length >= 2097152) _outBuf = reuseBuf;
+  else if (_outBuf === null || _outBuf.length < 2097152) _outBuf = Buffer.allocUnsafe(2097152);
+  _outLen = _outBuf.length;
+  _outPos = 0;
+  _segStart = 0;
+  _iovs.length = 0;
   _outFd = fd;
   _writeSync = writeSyncFn;
+  _writevSync = typeof writevSyncFn === 'function' ? writevSyncFn : null;
   _chunk = '[';
   for (let i = 0; i < cases.length; i++) {
     if (i > 0) _chunk += ',{';

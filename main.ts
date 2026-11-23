@@ -1,4 +1,4 @@
-import { closeSync, fstatSync, openSync, readSync, writeSync } from 'node:fs';
+import { closeSync, fstatSync, openSync, readSync, writeSync, writevSync } from 'node:fs';
 import { setFlagsFromString } from 'node:v8';
 
 // Tune V8 for short single-CPU batch execution in Node 22:
@@ -8,7 +8,13 @@ setFlagsFromString(
 );
 
 const { runBatchToFd } = (await import('./solve.js')) as {
-  runBatchToFd: (cases: { id: string; input: unknown }[], fd: number, writeSyncFn: typeof writeSync, reuseBuf?: Buffer) => void;
+  runBatchToFd: (
+    cases: { id: string; input: unknown }[],
+    fd: number,
+    writeSyncFn: typeof writeSync,
+    reuseBuf?: Buffer,
+    writevSyncFn?: typeof writevSync
+  ) => void;
 };
 
 const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
@@ -22,5 +28,5 @@ while (inOff < inSize) inOff += readSync(inFd, inBuf, inOff, inSize - inOff, nul
 closeSync(inFd);
 const cases = JSON.parse(inBuf.toString('utf8')) as { id: string; input: unknown }[];
 const fd = openSync(OUTPUT_DIR + '/answers.json', 'w');
-runBatchToFd(cases, fd, writeSync, inBuf);
+runBatchToFd(cases, fd, writeSync, inBuf, writevSync);
 closeSync(fd);
