@@ -89,6 +89,22 @@ const escCb = (c) => ESC_MAP[c];
 const JSON_ESC_TEST_RE = /["\\\x00-\x1f\ud800-\udfff]/;
 const FLAT_RE = /^/;
 let _jsonMode = false;
+let _mdJsonDirect = false;
+
+const JSON_CTRL_STR = new Array(32);
+for (let c = 0; c < 32; c++) {
+  JSON_CTRL_STR[c] = '\\u00' + (c < 16 ? '0' : '') + c.toString(16);
+}
+JSON_CTRL_STR[8] = '\\b';
+JSON_CTRL_STR[9] = '\\t';
+JSON_CTRL_STR[10] = '\\n';
+JSON_CTRL_STR[12] = '\\f';
+JSON_CTRL_STR[13] = '\\r';
+
+const ESC_JSON_RE = /[&<>"'\\\x00-\x1f\ud800-\udfff]/g;
+const INLINE_JSON_RE = /[&<>"'\\`*\[\x00-\x1f\ud800-\udfff]/g;
+const TICK_OR_ESC_JSON_RE = /[&<>"'`\\\x00-\x1f\ud800-\udfff]/g;
+const BRACKET_OR_INLINE_JSON_RE = /[&<>"'\\`*[\]\x00-\x1f\ud800-\udfff]/g;
 
 function jsonSliceAlways(s) {
   if (s.length === 0) return '';
@@ -105,9 +121,19 @@ function jsonSliceFast(s) {
 const INLINE_RE = /[&<>"'\\`*\[]/g;
 const TICK_OR_ESC_RE = /[&<>"'`]/g;
 const BRACKET_OR_INLINE_RE = /[&<>"'\\`*[\]]/g;
+const WORD_201_RE = /\s*\S+(?:\s+\S+){200}/y;
 const WORD_200_RE = /\s*\S+(?:\s+\S+){199}/y;
-const WORD_1_RE = /\s*\S+/y;
 const CLOSE_PAREN_OR_WS_RE = /[)\s]/g;
+const LS_PS_RE = /[\u2028\u2029]/;
+let _mdHasLsPs = false;
+
+function hasLsPsIn(s, start, end) {
+  for (let i = start; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 0x2028 || c === 0x2029) return true;
+  }
+  return false;
+}
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -123,6 +149,67 @@ function escapeHtmlSpan(s, start, end) {
   ESC_RE.lastIndex = start;
   if (!ESC_RE.test(s) || ESC_RE.lastIndex - 1 >= end) return s.slice(start, end);
   return s.slice(start, end).replace(ESC_RE, escCb);
+}
+
+function escapeHtmlJsonSpan(s, start, end) {
+  if (start >= end) return '';
+  ESC_JSON_RE.lastIndex = start;
+  if (!ESC_JSON_RE.test(s) || ESC_JSON_RE.lastIndex - 1 >= end) return s.slice(start, end);
+  let out = '';
+  let last = start;
+  let i = ESC_JSON_RE.lastIndex - 1;
+  while (true) {
+    const c = s.charCodeAt(i);
+    if (c < 128) {
+      if (last < i) out += s.slice(last, i);
+      if (c < 32) {
+        out += JSON_CTRL_STR[c];
+      } else if (c === 92) {
+        out += '\\\\';
+      } else {
+        out += HTML_ESC_STR[HTML_ESC_TBL[c]];
+      }
+      i++;
+      last = i;
+    } else {
+      // Surrogate 0xd800..0xdfff
+      if (c <= 0xdbff && i + 1 < end) {
+        const nc = s.charCodeAt(i + 1);
+        if (nc >= 0xdc00 && nc <= 0xdfff) {
+          i += 2;
+        } else {
+          if (last < i) out += s.slice(last, i);
+          out += '\\u' + c.toString(16);
+          i++;
+          last = i;
+        }
+      } else {
+        if (last < i) out += s.slice(last, i);
+        out += '\\u' + c.toString(16);
+        i++;
+        last = i;
+      }
+    }
+    if (i >= end) break;
+    ESC_JSON_RE.lastIndex = i;
+    if (!ESC_JSON_RE.test(s)) break;
+    i = ESC_JSON_RE.lastIndex - 1;
+    if (i >= end) break;
+  }
+  if (last === start) return s.slice(start, end);
+  if (last < end) out += s.slice(last, end);
+  return out;
+}
+
+function escapeHtmlJson(s) {
+  return escapeHtmlJsonSpan(s, 0, s.length);
+}
+
+function escapeFenceJsonSpan(s, start, end) {
+  const sub = s.slice(start, end);
+  const h = ESC_TEST_RE.test(sub) ? sub.replace(ESC_RE, escCb) : sub;
+  const q = JSON.stringify(h);
+  return q.slice(1, q.length - 1);
 }
 
 function slugifyAsciiFrom(plain) {
@@ -234,19 +321,18 @@ function isJsWs(c) {
 
 function readingMinutesOf(s, start) {
   const len = s.length;
-  let pos = start;
-  let mins = 0;
+  if (len - start < 401) return 1;
+  WORD_201_RE.lastIndex = start;
+  if (!WORD_201_RE.test(s)) return 1;
+  let mins = 2;
+  let pos = WORD_201_RE.lastIndex;
   while (len - pos >= 399) {
     WORD_200_RE.lastIndex = pos;
     if (!WORD_200_RE.test(s)) break;
     mins++;
     pos = WORD_200_RE.lastIndex;
   }
-  if (pos < len) {
-    WORD_1_RE.lastIndex = pos;
-    if (WORD_1_RE.test(s)) mins++;
-  }
-  return mins === 0 ? 1 : mins;
+  return mins;
 }
 
 // ---------------------------------------------------------------- front matter
@@ -450,6 +536,7 @@ function parseFrontMatter(text) {
   let slug = undefined;
   let summary = undefined;
   let seen = 0; // bit 0=title, 1=date, 2=tags, 3=draft, 4=layout, 5=slug, 6=summary
+  const fmHasLsPs = LS_PS_RE.test(text);
 
   let pos = 4;
   let lineNo = 2;
@@ -477,6 +564,10 @@ function parseFrontMatter(text) {
             vs = nl;
             ve = nl;
           } else if (text.charCodeAt(ke + 1) === 32) {
+            if (fmHasLsPs && hasLsPsIn(text, ke + 2, nl)) {
+              _fmErr = 'line ' + lineNo + ' is not "key: value"';
+              return null;
+            }
             vs = ke + 2;
             ve = nl;
             while (ve > vs && (text.charCodeAt(ve - 1) === 32 || text.charCodeAt(ve - 1) === 9)) ve--;
@@ -615,6 +706,7 @@ function matchHeading(s, ls, le) {
   let e = le;
   while (e > k && (s.charCodeAt(e - 1) === 32 || s.charCodeAt(e - 1) === 9)) e--;
   if (k >= e) return 0;
+  if (_mdHasLsPs && hasLsPsIn(s, k, e)) return 0;
   _hStart = k;
   _hEnd = e;
   return depth;
@@ -646,7 +738,8 @@ function endsParagraphLine(s, ls, le) {
 function isBulletLine(s, ls, le) {
   if (le - ls < 2) return false;
   const c0 = s.charCodeAt(ls);
-  return (c0 === 45 || c0 === 42) && s.charCodeAt(ls + 1) === 32;
+  if ((c0 !== 45 && c0 !== 42) || s.charCodeAt(ls + 1) !== 32) return false;
+  return !(_mdHasLsPs && hasLsPsIn(s, ls + 2, le));
 }
 
 let _ordVal = 0;
@@ -666,6 +759,7 @@ function matchOrderedLine(s, ls, le) {
     } else break;
   }
   if (k + 1 >= le || s.charCodeAt(k) !== 46 || s.charCodeAt(k + 1) !== 32) return false;
+  if (_mdHasLsPs && hasLsPsIn(s, k + 2, le)) return false;
   _ordVal = val;
   _ordTextStart = k + 2;
   return true;
@@ -745,9 +839,11 @@ let _mdBroken = null;
 const _mdIds = new Set();
 const H_OPEN = ['', '<h1 id="', '<h2 id="', '<h3 id="', '<h4 id="', '<h5 id="', '<h6 id="'];
 const H_CLOSE = ['', '</h1>\n', '</h2>\n', '</h3>\n', '</h4>\n', '</h5>\n', '</h6>\n'];
+const H_OPEN_J = ['', '<h1 id=\\"', '<h2 id=\\"', '<h3 id=\\"', '<h4 id=\\"', '<h5 id=\\"', '<h6 id=\\"'];
+const H_CLOSE_J = ['', '</h1>\\n', '</h2>\\n', '</h3>\\n', '</h4>\\n', '</h5>\\n', '</h6>\\n'];
 
 function makeDirInfo(dirStr) {
-  if (dirStr === '') return { str: '', parts: [], prefixes: [''] };
+  if (dirStr === '') return { str: '', parts: [], prefixes: [''], linkCache: new Map() };
   const parts = dirStr.split('/');
   const prefixes = new Array(parts.length + 1);
   prefixes[0] = '';
@@ -756,7 +852,7 @@ function makeDirInfo(dirStr) {
     acc += parts[i] + '/';
     prefixes[i + 1] = acc;
   }
-  return { str: dirStr, parts, prefixes };
+  return { str: dirStr, parts, prefixes, linkCache: new Map() };
 }
 
 function resolvePathFast(dirInfo, rel) {
@@ -805,12 +901,15 @@ function resolvePathFast(dirInfo, rel) {
 function resolveLink(s, tStart, tEnd) {
   const c0 = s.charCodeAt(tStart);
   if (c0 === 47 || c0 === 35) {
-    return escapeHtmlSpan(s, tStart, tEnd);
+    return _mdJsonDirect ? escapeHtmlJsonSpan(s, tStart, tEnd) : escapeHtmlSpan(s, tStart, tEnd);
   }
   if (c0 !== 46 && hasScheme(s, tStart, tEnd)) {
-    return escapeHtmlSpan(s, tStart, tEnd);
+    return _mdJsonDirect ? escapeHtmlJsonSpan(s, tStart, tEnd) : escapeHtmlSpan(s, tStart, tEnd);
   }
   const target = s.slice(tStart, tEnd);
+  const lc = _mdDirInfo.linkCache;
+  const cached = lc.get(target);
+  if (cached !== undefined) return cached;
   const hash = target.indexOf('#');
   const rel = hash === -1 ? target : target.slice(0, hash);
   if (rel.length > 0) {
@@ -818,12 +917,14 @@ function resolveLink(s, tStart, tEnd) {
     if (path !== null) {
       const destEsc = _mdResolvedUrlsEsc.get(path);
       if (destEsc !== undefined) {
-        return hash === -1 ? destEsc : destEsc + escapeHtml(target.slice(hash));
+        const res = hash === -1 ? destEsc : destEsc + (_mdJsonDirect ? escapeHtmlJson(target.slice(hash)) : escapeHtml(target.slice(hash)));
+        lc.set(target, res);
+        return res;
       }
     }
   }
   _mdBroken.add('broken-link ' + _mdSourcePath + ' -> ' + target);
-  return escapeHtml(target);
+  return _mdJsonDirect ? escapeHtmlJson(target) : escapeHtml(target);
 }
 
 function inlineSpan(s, start, end) {
@@ -1008,6 +1109,212 @@ function inlineSpan(s, start, end) {
   return out;
 }
 
+function inlineSpanJson(s, start, end) {
+  if (start >= end) return '';
+  INLINE_JSON_RE.lastIndex = start;
+  if (!INLINE_JSON_RE.test(s) || INLINE_JSON_RE.lastIndex - 1 >= end) {
+    return s.slice(start, end);
+  }
+  let out = '';
+  let last = start;
+  let i = INLINE_JSON_RE.lastIndex - 1;
+  while (true) {
+    const c = s.charCodeAt(i);
+    if (c < 32) {
+      if (last < i) out += s.slice(last, i);
+      out += JSON_CTRL_STR[c];
+      i++;
+      last = i;
+    } else if (c >= 0xd800) {
+      if (c <= 0xdbff && i + 1 < end) {
+        const nc = s.charCodeAt(i + 1);
+        if (nc >= 0xdc00 && nc <= 0xdfff) {
+          i += 2;
+        } else {
+          if (last < i) out += s.slice(last, i);
+          out += '\\u' + c.toString(16);
+          i++;
+          last = i;
+        }
+      } else {
+        if (last < i) out += s.slice(last, i);
+        out += '\\u' + c.toString(16);
+        i++;
+        last = i;
+      }
+    } else {
+      const kind = INLINE_TBL[c];
+      if (kind <= 5) {
+        if (last < i) out += s.slice(last, i);
+        out += HTML_ESC_STR[kind];
+        i++;
+        last = i;
+      } else if (kind === 6) {
+        if (last < i) out += s.slice(last, i);
+        if (i + 1 < end) {
+          const nc = s.charCodeAt(i + 1);
+          if (nc < 128 && ESCAPABLE_TBL[nc] === 1) {
+            out += nc === 62 ? '&gt;' : (nc === 92 ? '\\\\' : ASCII_CHAR[nc]);
+            i += 2;
+            last = i;
+          } else {
+            out += '\\\\';
+            i++;
+            last = i;
+          }
+        } else {
+          out += '\\\\';
+          i++;
+          last = i;
+        }
+      } else if (kind === 7) {
+        TICK_OR_ESC_JSON_RE.lastIndex = i + 1;
+        if (TICK_OR_ESC_JSON_RE.test(s)) {
+          const hit = TICK_OR_ESC_JSON_RE.lastIndex - 1;
+          if (hit < end) {
+            if (s.charCodeAt(hit) === 96) {
+              if (hit > i + 1) {
+                if (last < i) out += s.slice(last, i);
+                out += '<code>' + s.slice(i + 1, hit) + '</code>';
+                i = hit + 1;
+                last = i;
+              } else {
+                i++;
+              }
+            } else {
+              const j = s.indexOf('`', hit + 1);
+              if (j > i + 1 && j < end) {
+                if (last < i) out += s.slice(last, i);
+                out += '<code>' + escapeHtmlJsonSpan(s, i + 1, j) + '</code>';
+                i = j + 1;
+                last = i;
+              } else {
+                i++;
+              }
+            }
+          } else {
+            i++;
+          }
+        } else {
+          i++;
+        }
+      } else if (kind === 8) {
+        if (i + 1 < end && s.charCodeAt(i + 1) === 42) {
+          INLINE_JSON_RE.lastIndex = i + 2;
+          if (INLINE_JSON_RE.test(s)) {
+            const hit = INLINE_JSON_RE.lastIndex - 1;
+            if (hit < end) {
+              if (s.charCodeAt(hit) === 42 && hit + 1 < end && s.charCodeAt(hit + 1) === 42) {
+                if (hit > i + 2) {
+                  if (last < i) out += s.slice(last, i);
+                  out += '<strong>' + s.slice(i + 2, hit) + '</strong>';
+                  i = hit + 2;
+                  last = i;
+                } else {
+                  i += 2;
+                }
+              } else {
+                const j = findUnescapedDoubleStar(s, hit, end);
+                if (j > i + 2) {
+                  if (last < i) out += s.slice(last, i);
+                  out += '<strong>' + inlineSpanJson(s, i + 2, j) + '</strong>';
+                  i = j + 2;
+                  last = i;
+                } else {
+                  i += 2;
+                }
+              }
+            } else {
+              i += 2;
+            }
+          } else {
+            i += 2;
+          }
+        } else {
+          INLINE_JSON_RE.lastIndex = i + 1;
+          if (INLINE_JSON_RE.test(s)) {
+            const hit = INLINE_JSON_RE.lastIndex - 1;
+            if (hit < end) {
+              if (s.charCodeAt(hit) === 42 && (hit + 1 >= end || s.charCodeAt(hit + 1) !== 42)) {
+                if (hit > i + 1) {
+                  if (last < i) out += s.slice(last, i);
+                  out += '<em>' + s.slice(i + 1, hit) + '</em>';
+                  i = hit + 1;
+                  last = i;
+                } else {
+                  i++;
+                }
+              } else {
+                const j = findSingleStar(s, hit, end);
+                if (j > i + 1) {
+                  if (last < i) out += s.slice(last, i);
+                  out += '<em>' + inlineSpanJson(s, i + 1, j) + '</em>';
+                  i = j + 1;
+                  last = i;
+                } else {
+                  i++;
+                }
+              }
+            } else {
+              i++;
+            }
+          } else {
+            i++;
+          }
+        }
+      } else {
+        BRACKET_OR_INLINE_JSON_RE.lastIndex = i + 1;
+        if (BRACKET_OR_INLINE_JSON_RE.test(s)) {
+          const hit = BRACKET_OR_INLINE_JSON_RE.lastIndex - 1;
+          if (hit < end) {
+            let k;
+            let cleanLabel;
+            if (s.charCodeAt(hit) === 93) {
+              k = hit;
+              cleanLabel = true;
+            } else {
+              k = findUnescapedCloseBracket(s, hit, end);
+              cleanLabel = false;
+            }
+            if (k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40) {
+              CLOSE_PAREN_OR_WS_RE.lastIndex = k + 2;
+              if (CLOSE_PAREN_OR_WS_RE.test(s)) {
+                const m = CLOSE_PAREN_OR_WS_RE.lastIndex - 1;
+                if (m > k + 2 && m < end && s.charCodeAt(m) === 41) {
+                  if (last < i) out += s.slice(last, i);
+                  const href = resolveLink(s, k + 2, m);
+                  const label = cleanLabel ? s.slice(i + 1, k) : inlineSpanJson(s, i + 1, k);
+                  out += '<a href=\\"' + href + '\\">' + label + '</a>';
+                  i = m + 1;
+                  last = i;
+                } else {
+                  i++;
+                }
+              } else {
+                i++;
+              }
+            } else {
+              i++;
+            }
+          } else {
+            i++;
+          }
+        } else {
+          i++;
+        }
+      }
+    }
+    if (i >= end) break;
+    INLINE_JSON_RE.lastIndex = i;
+    if (!INLINE_JSON_RE.test(s)) break;
+    i = INLINE_JSON_RE.lastIndex - 1;
+    if (i >= end) break;
+  }
+  if (last === start) return s.slice(start, end);
+  if (last < end) out += s.slice(last, end);
+  return out;
+}
+
 function trimSpacesTabsStart(s, ls, le) {
   while (ls < le && (s.charCodeAt(ls) === 32 || s.charCodeAt(ls) === 9)) ls++;
   return ls;
@@ -1023,12 +1330,22 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
   _mdSourcePath = sourcePath;
   _mdResolvedUrlsEsc = resolvedUrlsEsc;
   _mdBroken = broken;
+  _mdHasLsPs = LS_PS_RE.test(src);
   _mdIds.clear();
 
   const len = src.length;
   const toc = [];
   let excerpt = null;
-  let html = '';
+  const htmlParts = [];
+  const jd = _mdJsonDirect;
+  const inl = jd ? inlineSpanJson : inlineSpan;
+  const hOpen = jd ? H_OPEN_J : H_OPEN;
+  const hClose = jd ? H_CLOSE_J : H_CLOSE;
+  const attrMid = jd ? '\\">' : '">';
+  const pClose = jd ? '</p>\\n' : '</p>\n';
+  const liClose = jd ? '</li>\\n' : '</li>\n';
+  const olClose = jd ? '</li>\\n</ol>\\n' : '</li>\n</ol>\n';
+  const ulClose = jd ? '</li>\\n</ul>\\n' : '</li>\n</ul>\n';
 
   let ls = bodyStart;
   let nl = src.indexOf('\n', ls);
@@ -1083,11 +1400,13 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
             le = nl === -1 ? len : nl;
           }
         }
-        const openTag = lang === '' ? '<pre><code>' : '<pre><code class="language-' + lang + '">';
+        const openTag = lang === ''
+          ? '<pre><code>'
+          : (jd ? '<pre><code class=\\"language-' + lang + '\\">' : '<pre><code class="language-' + lang + '">');
         if (bodyBegin === -1) {
-          html += openTag + '</code></pre>\n';
+          htmlParts.push(openTag + (jd ? '</code></pre>\\n' : '</code></pre>\n'));
         } else {
-          html += openTag + escapeHtmlSpan(src, bodyBegin, bodyEnd) + '\n</code></pre>\n';
+          htmlParts.push(openTag + (jd ? escapeFenceJsonSpan(src, bodyBegin, bodyEnd) : escapeHtmlSpan(src, bodyBegin, bodyEnd)) + (jd ? '\\n</code></pre>\\n' : '\n</code></pre>\n'));
         }
         continue;
       }
@@ -1100,10 +1419,10 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
         const he = _hEnd;
         const hText = src.slice(hs, he);
         const id = uniqueSlug(slugify(hText), _mdIds);
-        const inner = inlineSpan(hText, 0, hText.length);
-        html += H_OPEN[depth] + id + '">' + inner + H_CLOSE[depth];
+        const inner = inl(hText, 0, hText.length);
+        htmlParts.push(hOpen[depth] + id + attrMid + inner + hClose[depth]);
         if (depth === 2 || depth === 3) {
-          toc.push(_jsonMode ? { level: depth, id, html: inner, $html: jsonSliceFast(inner) } : { level: depth, id, html: inner });
+          toc.push(jd ? { level: depth, id, html: inner, $html: inner } : (_jsonMode ? { level: depth, id, html: inner, $html: jsonSliceFast(inner) } : { level: depth, id, html: inner }));
         }
         if (nl === -1) break;
         ls = nl + 1;
@@ -1114,7 +1433,7 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
     }
     // HR
     if ((c0 === 45 || c0 === 42) && isHr(src, ls, le)) {
-      html += '<hr>\n';
+      htmlParts.push(jd ? '<hr>\\n' : '<hr>\n');
       if (nl === -1) break;
       ls = nl + 1;
       nl = src.indexOf('\n', ls);
@@ -1149,11 +1468,11 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
         }
       }
       if (firstS === -1) {
-        html += '<blockquote>\n</blockquote>\n';
+        htmlParts.push(jd ? '<blockquote>\\n</blockquote>\\n' : '<blockquote>\n</blockquote>\n');
       } else if (parts === null) {
-        html += '<blockquote>\n<p>' + inlineSpan(src, firstS, firstE) + '</p>\n</blockquote>\n';
+        htmlParts.push((jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>') + inl(src, firstS, firstE) + (jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n'));
       } else {
-        html += '<blockquote>\n<p>' + inlineSpan(parts, 0, parts.length) + '</p>\n</blockquote>\n';
+        htmlParts.push((jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>') + inl(parts, 0, parts.length) + (jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n'));
       }
       continue;
     }
@@ -1162,7 +1481,9 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
     const isOrdered = !isBullet && c0 >= 48 && c0 <= 57 && matchOrderedLine(src, ls, le);
     if (isBullet || isOrdered) {
       const startNum = isOrdered ? _ordVal : 1;
-      html += isOrdered ? (startNum !== 1 ? '<ol start="' + startNum + '">\n' : '<ol>\n') : '<ul>\n';
+      htmlParts.push(isOrdered
+        ? (startNum !== 1 ? (jd ? '<ol start=\\"' + startNum + '\\">\\n' : '<ol start="' + startNum + '">\n') : (jd ? '<ol>\\n' : '<ol>\n'))
+        : (jd ? '<ul>\\n' : '<ul>\n'));
       let itemS = trimSpacesTabsStart(src, isOrdered ? _ordTextStart : ls + 2, le);
       let itemE = trimSpacesTabsEnd(src, itemS, le);
       let itemJoined = null;
@@ -1176,9 +1497,9 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       while (hasLine) {
         if (isOrdered ? matchOrderedLine(src, ls, le) : isBulletLine(src, ls, le)) {
           const inner = itemJoined === null
-            ? inlineSpan(src, itemS, itemE)
-            : inlineSpan(itemJoined, 0, itemJoined.length);
-          html += '<li>' + inner + '</li>\n';
+            ? inl(src, itemS, itemE)
+            : inl(itemJoined, 0, itemJoined.length);
+          htmlParts.push('<li>' + inner + liClose);
           itemS = trimSpacesTabsStart(src, isOrdered ? _ordTextStart : ls + 2, le);
           itemE = trimSpacesTabsEnd(src, itemS, le);
           itemJoined = null;
@@ -1209,9 +1530,9 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
         }
       }
       const inner = itemJoined === null
-        ? inlineSpan(src, itemS, itemE)
-        : inlineSpan(itemJoined, 0, itemJoined.length);
-      html += '<li>' + inner + (isOrdered ? '</li>\n</ol>\n' : '</li>\n</ul>\n');
+        ? inl(src, itemS, itemE)
+        : inl(itemJoined, 0, itemJoined.length);
+      htmlParts.push('<li>' + inner + (isOrdered ? olClose : ulClose));
       continue;
     }
     // Paragraph
@@ -1265,13 +1586,13 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       }
     }
     const inner = pJoined === null
-      ? inlineSpan(src, pStart0, pEnd0)
-      : inlineSpan(pJoined, 0, pJoined.length);
+      ? inl(src, pStart0, pEnd0)
+      : inl(pJoined, 0, pJoined.length);
     if (excerpt === null) excerpt = inner;
-    html += '<p>' + inner + '</p>\n';
+    htmlParts.push('<p>' + inner + pClose);
   }
 
-  return { html, toc, excerpt: excerpt === null ? '' : excerpt };
+  return { html: htmlParts.join(''), toc, excerpt: excerpt === null ? '' : excerpt };
 }
 
 // ---------------------------------------------------------------- templates
@@ -1465,7 +1786,8 @@ function jsonifyOps(ops) {
 }
 
 const PLAIN_KEY_RE = /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/;
-let _outBuf = Buffer.allocUnsafe(2097152);
+const NON_ASCII_RE = /[^\x00-\x7f]/;
+let _outBuf = null;
 let _outFd = -1;
 let _writeSync = null;
 let _chunk = '';
@@ -1473,11 +1795,14 @@ let _chunk = '';
 function flushChunk() {
   const clen = _chunk.length;
   if (clen === 0) return;
-  FLAT_RE.test(_chunk);
-  const maxBytes = clen * 3;
-  if (maxBytes > _outBuf.length) _outBuf = Buffer.allocUnsafe(maxBytes);
-  const n = _outBuf.write(_chunk, 0, 'utf8');
-  _writeSync(_outFd, _outBuf, 0, n);
+  const hasNonAscii = NON_ASCII_RE.test(_chunk);
+  const maxBytes = hasNonAscii ? clen * 3 : clen;
+  if (_outBuf === null || maxBytes > _outBuf.length) {
+    _outBuf = Buffer.allocUnsafe(maxBytes > 2097152 ? maxBytes : 2097152);
+  }
+  const n = _outBuf.write(_chunk, 0, hasNonAscii ? 'utf8' : 'latin1');
+  let off = 0;
+  while (off < n) off += _writeSync(_outFd, _outBuf, off, n - off);
   _chunk = '';
 }
 
@@ -1956,6 +2281,38 @@ function templateMentionsKey(nodes, templates, targetKey, depth) {
   return false;
 }
 
+function astNeedsRawHtml(nodes) {
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    if (n.kind === 1) {
+      const p = n.path;
+      for (let j = 0; j < p.length; j++) {
+        const k = p[j];
+        if (k === 'content' || k === 'excerpt' || k === 'html') return true;
+      }
+    } else if (n.kind === 2) {
+      const p = n.path;
+      if (p.length >= 4) {
+        const last = p[p.length - 1];
+        if (last === 'content' || last === 'excerpt' || last === 'html') return true;
+      }
+    } else if (n.kind === 3) {
+      if (astNeedsRawHtml(n.then)) return true;
+      if (n.else !== null && astNeedsRawHtml(n.else)) return true;
+    } else if (n.kind === 4) {
+      if (astNeedsRawHtml(n.body)) return true;
+    }
+  }
+  return false;
+}
+
+function templatesNeedRawHtml(templates) {
+  for (const ast of templates.values()) {
+    if (astNeedsRawHtml(ast)) return true;
+  }
+  return false;
+}
+
 // ---------------------------------------------------------------- build pipeline
 
 function dirOf(path) {
@@ -1964,6 +2321,8 @@ function dirOf(path) {
 }
 
 export function run(input, jsonMode = false) {
+  slugCache.clear();
+  dateCache.clear();
   _jsonMode = jsonMode;
   // 1. Parse templates in code-unit order of name
   const templates = new Map();
@@ -1984,6 +2343,7 @@ export function run(input, jsonMode = false) {
   while (baseEnd > 0 && base.charCodeAt(baseEnd - 1) === 47) baseEnd--;
   if (baseEnd !== base.length) base = base.slice(0, baseEnd);
   let baseSafe = escapeHtml(base) === base && (!jsonMode || !JSON_ESC_TEST_RE.test(base));
+  _mdJsonDirect = jsonMode && !templatesNeedRawHtml(templates);
 
   // Check which layouts ever mention reading_minutes (skip word counting on layouts that don't!)
   const layoutNeedsReadingMinutes = new Map();
@@ -2016,7 +2376,7 @@ export function run(input, jsonMode = false) {
     if (!path.endsWith('.md')) {
       statics.push(f);
       const staticUrl = base + '/' + path;
-      resolvedUrlsEsc.set(path, escapeHtml(staticUrl));
+      resolvedUrlsEsc.set(path, _mdJsonDirect ? escapeHtmlJson(staticUrl) : escapeHtml(staticUrl));
       continue;
     }
     let text = f.content;
@@ -2098,7 +2458,7 @@ export function run(input, jsonMode = false) {
     s.slug = slug;
     s.outDir = outDir;
     s.url = url;
-    resolvedUrlsEsc.set(s.path, baseSafe ? url : escapeHtml(url));
+    resolvedUrlsEsc.set(s.path, baseSafe ? url : (_mdJsonDirect ? escapeHtmlJson(url) : escapeHtml(url)));
   }
 
   // 5. Markdown + word count (only when needed)
@@ -2215,6 +2575,7 @@ export function run(input, jsonMode = false) {
   );
 
   // Build cards for all posts once (with pre-escaped $title and $summary)
+  const recentCount = Math.min(posts.length, input.site.recent);
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
     const date = p.data.date;
@@ -2230,8 +2591,8 @@ export function run(input, jsonMode = false) {
       date_long: longDate(date),
       summary,
       $summary: jsonMode ? jsonSliceFast(rawSumEsc) : rawSumEsc,
-      excerpt: p.excerpt,
-      $excerpt: jsonMode ? jsonSliceAlways(p.excerpt) : p.excerpt,
+      excerpt: (_mdJsonDirect && i < recentCount && p.excerpt !== '') ? JSON.parse('"' + p.excerpt + '"') : p.excerpt,
+      $excerpt: _mdJsonDirect ? p.excerpt : (jsonMode ? jsonSliceAlways(p.excerpt) : p.excerpt),
       reading_minutes: p.readingMinutes,
       tags: p.tagLinks,
     };
@@ -2246,7 +2607,6 @@ export function run(input, jsonMode = false) {
     const t = sortedTags[i];
     allTags[i] = { name: t.name, $name: t.$name, slug: t.slug, url: t.url, count: t.posts.length };
   }
-  const recentCount = Math.min(posts.length, input.site.recent);
   const recent = new Array(recentCount);
   for (let i = 0; i < recentCount; i++) recent[i] = posts[i].card;
 
@@ -2335,7 +2695,7 @@ export function run(input, jsonMode = false) {
         pageObj.tags = c.tags;
         pageObj.slug = s.slug;
         pageObj.content = s.html;
-        pageObj.$content = jsonSliceAlways(s.html);
+        pageObj.$content = _mdJsonDirect ? s.html : jsonSliceAlways(s.html);
         pageObj.toc = s.toc;
         pageObj.newer = linkOfPost(s.newer);
         pageObj.older = linkOfPost(s.older);
@@ -2354,12 +2714,12 @@ export function run(input, jsonMode = false) {
         pageObj.summary = summary;
         pageObj.$summary = jsonSliceFast(rawSumEsc);
         pageObj.excerpt = s.excerpt;
-        pageObj.$excerpt = jsonSliceFast(s.excerpt);
+        pageObj.$excerpt = _mdJsonDirect ? s.excerpt : jsonSliceFast(s.excerpt);
         pageObj.reading_minutes = s.readingMinutes;
         pageObj.tags = s.tagLinks;
         pageObj.slug = s.slug;
         pageObj.content = s.html;
-        pageObj.$content = jsonSliceAlways(s.html);
+        pageObj.$content = _mdJsonDirect ? s.html : jsonSliceAlways(s.html);
         pageObj.toc = s.toc;
         pageObj.newer = null;
         pageObj.older = null;
@@ -2476,6 +2836,7 @@ export function run(input, jsonMode = false) {
     );
     const repStr = reportLines.join('\n') + '\n';
     emitEntry(REPORT_FILE, jsonSliceAlways(repStr), firstEntry, true);
+    _mdJsonDirect = false;
     _jsonMode = false;
     return null;
   }
@@ -2636,7 +2997,8 @@ export function run(input, jsonMode = false) {
   return output;
 }
 
-export function runBatchToFd(cases, fd, writeSyncFn) {
+export function runBatchToFd(cases, fd, writeSyncFn, reuseBuf) {
+  if (reuseBuf && reuseBuf.length >= 1048576) _outBuf = reuseBuf;
   _outFd = fd;
   _writeSync = writeSyncFn;
   _chunk = '[';
