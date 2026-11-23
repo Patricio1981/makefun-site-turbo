@@ -121,10 +121,11 @@ function jsonSliceFast(s) {
 const INLINE_RE = /[&<>"'\\`*\[]/g;
 const TICK_OR_ESC_RE = /[&<>"'`]/g;
 const BRACKET_OR_INLINE_RE = /[&<>"'\\`*[\]]/g;
-const WORD_201_RE = /\s*\S+(?:\s+\S+){200}/y;
-const WORD_200_RE = /\s*\S+(?:\s+\S+){199}/y;
+const WORD_FIRST_RE = /\s*\S+(?:\s+\S+){0,199}/y;
+const WORD_199_RE = /(?:\s+\S+){0,199}/y;
+const WORD_ONE_RE = /\s+\S+/y;
 const CLOSE_PAREN_OR_WS_RE = /[)\s]/g;
-const LS_PS_RE = /[\u2028\u2029]/;
+const PARA_END_RE = /\n[\n \t#`*-]|[ \t]\n/g;
 let _mdHasLsPs = false;
 
 function hasLsPsIn(s, start, end) {
@@ -205,71 +206,38 @@ function escapeHtmlJson(s) {
   return escapeHtmlJsonSpan(s, 0, s.length);
 }
 
+const INLINE_JSON_SIMPLE = new Array(128).fill('');
+for (let c = 0; c < 32; c++) INLINE_JSON_SIMPLE[c] = JSON_CTRL_STR[c];
+INLINE_JSON_SIMPLE[38] = '&amp;';
+INLINE_JSON_SIMPLE[60] = '&lt;';
+INLINE_JSON_SIMPLE[62] = '&gt;';
+INLINE_JSON_SIMPLE[34] = '&quot;';
+INLINE_JSON_SIMPLE[39] = '&#39;';
+
 function escapeFenceJsonSpan(s, start, end) {
-  const sub = s.slice(start, end);
-  const h = ESC_TEST_RE.test(sub) ? sub.replace(ESC_RE, escCb) : sub;
+  const h = s.slice(start, end).replace(ESC_RE, escCb);
   const q = JSON.stringify(h);
   return q.slice(1, q.length - 1);
 }
 
-function slugifyAsciiFrom(plain) {
-  const len = plain.length;
-  let outLen = 0;
-  let gap = false;
-  for (let i = 0; i < len; i++) {
-    const c = plain.charCodeAt(i);
-    const k = c < 128 ? SLUG_ASCII[c] : 0;
-    if (k === 0) {
-      if (outLen > 0) gap = true;
-      continue;
-    }
-    if (gap) {
-      if (outLen >= 63) break;
-      slugBuf[outLen++] = 45;
-      gap = false;
-    }
-    slugBuf[outLen++] = k;
-    if (outLen === 64) break;
-  }
-  while (outLen > 0 && slugBuf[outLen - 1] === 45) outLen--;
-  if (outLen === 0) return 'untitled';
-  return slugBuf.toString('latin1', 0, outLen);
-}
+const SLUG_NON_ASCII_RE = /[^\x00-\x7f]/;
+const SLUG_BAD_RE = /[^a-z0-9]+/g;
+const SLUG_DIAC_RE = /\p{M}/gu;
 
 function slugify(text) {
   const cached = slugCache.get(text);
   if (cached !== undefined) return cached;
-  const len = text.length;
-  let outLen = 0;
-  let gap = false;
-  let hasNonAscii = false;
-  for (let i = 0; i < len; i++) {
-    const c = text.charCodeAt(i);
-    if (c >= 128) {
-      hasNonAscii = true;
-      break;
-    }
-    const k = SLUG_ASCII[c];
-    if (k === 0) {
-      if (outLen > 0) gap = true;
-      continue;
-    }
-    if (gap) {
-      if (outLen >= 63) break;
-      slugBuf[outLen++] = 45;
-      gap = false;
-    }
-    slugBuf[outLen++] = k;
-    if (outLen === 64) break;
+  let s = SLUG_NON_ASCII_RE.test(text) ? text.normalize('NFKD').replace(SLUG_DIAC_RE, '') : text;
+  s = s.toLowerCase().replace(SLUG_BAD_RE, '-');
+  let a = 0;
+  let b = s.length;
+  if (b > 0 && s.charCodeAt(0) === 45) a = 1;
+  if (b > a && s.charCodeAt(b - 1) === 45) b--;
+  if (b - a > 64) {
+    b = a + 64;
+    if (s.charCodeAt(b - 1) === 45) b--;
   }
-  let res;
-  if (hasNonAscii) {
-    const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-    res = slugifyAsciiFrom(plain);
-  } else {
-    while (outLen > 0 && slugBuf[outLen - 1] === 45) outLen--;
-    res = outLen === 0 ? 'untitled' : slugBuf.toString('latin1', 0, outLen);
-  }
+  const res = a >= b ? 'untitled' : (a === 0 && b === s.length ? s : s.slice(a, b));
   if (slugCache.size >= 8192) slugCache.clear();
   slugCache.set(text, res);
   return res;
@@ -322,15 +290,23 @@ function isJsWs(c) {
 function readingMinutesOf(s, start) {
   const len = s.length;
   if (len - start < 401) return 1;
-  WORD_201_RE.lastIndex = start;
-  if (!WORD_201_RE.test(s)) return 1;
+  WORD_FIRST_RE.lastIndex = start;
+  if (!WORD_FIRST_RE.test(s)) return 1;
+  let pos = WORD_FIRST_RE.lastIndex;
+  if (len - pos < 2) return 1;
+  WORD_ONE_RE.lastIndex = pos;
+  if (!WORD_ONE_RE.test(s)) return 1;
   let mins = 2;
-  let pos = WORD_201_RE.lastIndex;
+  pos = WORD_ONE_RE.lastIndex;
   while (len - pos >= 399) {
-    WORD_200_RE.lastIndex = pos;
-    if (!WORD_200_RE.test(s)) break;
+    WORD_199_RE.lastIndex = pos;
+    WORD_199_RE.test(s);
+    pos = WORD_199_RE.lastIndex;
+    if (len - pos < 2) break;
+    WORD_ONE_RE.lastIndex = pos;
+    if (!WORD_ONE_RE.test(s)) break;
     mins++;
-    pos = WORD_200_RE.lastIndex;
+    pos = WORD_ONE_RE.lastIndex;
   }
   return mins;
 }
@@ -428,41 +404,30 @@ function parseFmDate(s, start, end) {
   return s.slice(start, end);
 }
 
+const FM_TAG_BAD_RE = /["[\]]/;
+const FM_KEY_RE = /^[a-z_]+$/;
+
 function parseFmTags(s, start, end) {
   if (end - start < 2 || s.charCodeAt(start) !== 91 || s.charCodeAt(end - 1) !== 93) {
     _fmErr = 'key "tags": not a list [a, b]';
     return null;
   }
-  let p = start + 1;
-  let q = end - 1;
-  while (p < q && isJsWs(s.charCodeAt(p))) p++;
-  while (q > p && isJsWs(s.charCodeAt(q - 1))) q--;
-  if (p === q) return [];
-  const tags = [];
-  let segStart = start + 1;
-  const innerEnd = end - 1;
-  while (segStart <= innerEnd) {
-    let comma = s.indexOf(',', segStart);
-    if (comma === -1 || comma > innerEnd) comma = innerEnd;
-    let ts = segStart;
-    let te = comma;
-    while (ts < te && isJsWs(s.charCodeAt(ts))) ts++;
-    while (te > ts && isJsWs(s.charCodeAt(te - 1))) te--;
-    if (ts === te) {
+  const inner = s.slice(start + 1, end - 1);
+  if (inner.trim().length === 0) return [];
+  if (FM_TAG_BAD_RE.test(inner)) {
+    _fmErr = 'key "tags": an empty tag, or one holding " [ or ]';
+    return null;
+  }
+  const parts = inner.split(',');
+  for (let i = 0; i < parts.length; i++) {
+    const t = parts[i].trim();
+    if (t.length === 0) {
       _fmErr = 'key "tags": an empty tag, or one holding " [ or ]';
       return null;
     }
-    for (let i = ts; i < te; i++) {
-      const c = s.charCodeAt(i);
-      if (c === 34 || c === 91 || c === 93) {
-        _fmErr = 'key "tags": an empty tag, or one holding " [ or ]';
-        return null;
-      }
-    }
-    tags.push(s.slice(ts, te));
-    segStart = comma + 1;
+    parts[i] = t;
   }
-  return tags;
+  return parts;
 }
 
 function isValidLayoutName(s, start, end) {
@@ -494,7 +459,7 @@ function isValidSlug(s, start, end) {
 
 let _fmBodyStart = 0;
 
-function parseFrontMatter(text) {
+function parseFrontMatter(text, fmHasLsPs) {
   const len = text.length;
   if (
     len < 3 ||
@@ -536,7 +501,6 @@ function parseFrontMatter(text) {
   let slug = undefined;
   let summary = undefined;
   let seen = 0; // bit 0=title, 1=date, 2=tags, 3=draft, 4=layout, 5=slug, 6=summary
-  const fmHasLsPs = LS_PS_RE.test(text);
 
   let pos = 4;
   let lineNo = 2;
@@ -549,13 +513,8 @@ function parseFrontMatter(text) {
         let k = pos;
         while (k < nl && (text.charCodeAt(k) === 32 || text.charCodeAt(k) === 9)) k++;
         if (k < nl) {
-          let ke = pos;
-          while (ke < nl) {
-            const kc = text.charCodeAt(ke);
-            if ((kc >= 97 && kc <= 122) || kc === 95) ke++;
-            else break;
-          }
-          if (ke === pos || ke >= nl || text.charCodeAt(ke) !== 58) {
+          const ke = text.indexOf(':', pos);
+          if (ke <= pos || ke >= nl) {
             _fmErr = 'line ' + lineNo + ' is not "key: value"';
             return null;
           }
@@ -592,7 +551,12 @@ function parseFrontMatter(text) {
           }
 
           if (keyId === -1) {
-            _fmErr = 'unknown key "' + text.slice(pos, ke) + '"';
+            const keyStr = text.slice(pos, ke);
+            if (!FM_KEY_RE.test(keyStr)) {
+              _fmErr = 'line ' + lineNo + ' is not "key: value"';
+              return null;
+            }
+            _fmErr = 'unknown key "' + keyStr + '"';
             return null;
           }
           const bit = 1 << keyId;
@@ -837,6 +801,7 @@ let _mdSourcePath = '';
 let _mdResolvedUrlsEsc = null;
 let _mdBroken = null;
 const _mdIds = new Set();
+const _mdHtmlParts = [];
 const H_OPEN = ['', '<h1 id="', '<h2 id="', '<h3 id="', '<h4 id="', '<h5 id="', '<h6 id="'];
 const H_CLOSE = ['', '</h1>\n', '</h2>\n', '</h3>\n', '</h4>\n', '</h5>\n', '</h6>\n'];
 const H_OPEN_J = ['', '<h1 id=\\"', '<h2 id=\\"', '<h3 id=\\"', '<h4 id=\\"', '<h5 id=\\"', '<h6 id=\\"'];
@@ -1120,54 +1085,34 @@ function inlineSpanJson(s, start, end) {
   let i = INLINE_JSON_RE.lastIndex - 1;
   while (true) {
     const c = s.charCodeAt(i);
-    if (c < 32) {
-      if (last < i) out += s.slice(last, i);
-      out += JSON_CTRL_STR[c];
-      i++;
-      last = i;
-    } else if (c >= 0xd800) {
-      if (c <= 0xdbff && i + 1 < end) {
-        const nc = s.charCodeAt(i + 1);
-        if (nc >= 0xdc00 && nc <= 0xdfff) {
-          i += 2;
-        } else {
-          if (last < i) out += s.slice(last, i);
-          out += '\\u' + c.toString(16);
-          i++;
-          last = i;
-        }
+    if (c < 128) {
+      const rep = INLINE_JSON_SIMPLE[c];
+      if (rep !== '') {
+        if (last < i) out += s.slice(last, i);
+        out += rep;
+        i++;
+        last = i;
       } else {
-        if (last < i) out += s.slice(last, i);
-        out += '\\u' + c.toString(16);
-        i++;
-        last = i;
-      }
-    } else {
-      const kind = INLINE_TBL[c];
-      if (kind <= 5) {
-        if (last < i) out += s.slice(last, i);
-        out += HTML_ESC_STR[kind];
-        i++;
-        last = i;
-      } else if (kind === 6) {
-        if (last < i) out += s.slice(last, i);
-        if (i + 1 < end) {
-          const nc = s.charCodeAt(i + 1);
-          if (nc < 128 && ESCAPABLE_TBL[nc] === 1) {
-            out += nc === 62 ? '&gt;' : (nc === 92 ? '\\\\' : ASCII_CHAR[nc]);
-            i += 2;
-            last = i;
+        const kind = INLINE_TBL[c];
+        if (kind === 6) {
+          if (last < i) out += s.slice(last, i);
+          if (i + 1 < end) {
+            const nc = s.charCodeAt(i + 1);
+            if (nc < 128 && ESCAPABLE_TBL[nc] === 1) {
+              out += nc === 62 ? '&gt;' : (nc === 92 ? '\\\\' : ASCII_CHAR[nc]);
+              i += 2;
+              last = i;
+            } else {
+              out += '\\\\';
+              i++;
+              last = i;
+            }
           } else {
             out += '\\\\';
             i++;
             last = i;
           }
-        } else {
-          out += '\\\\';
-          i++;
-          last = i;
-        }
-      } else if (kind === 7) {
+        } else if (kind === 7) {
         TICK_OR_ESC_JSON_RE.lastIndex = i + 1;
         if (TICK_OR_ESC_JSON_RE.test(s)) {
           const hit = TICK_OR_ESC_JSON_RE.lastIndex - 1;
@@ -1303,6 +1248,24 @@ function inlineSpanJson(s, start, end) {
           i++;
         }
       }
+      }
+    } else {
+      if (c <= 0xdbff && i + 1 < end) {
+        const nc = s.charCodeAt(i + 1);
+        if (nc >= 0xdc00 && nc <= 0xdfff) {
+          i += 2;
+        } else {
+          if (last < i) out += s.slice(last, i);
+          out += '\\u' + c.toString(16);
+          i++;
+          last = i;
+        }
+      } else {
+        if (last < i) out += s.slice(last, i);
+        out += '\\u' + c.toString(16);
+        i++;
+        last = i;
+      }
     }
     if (i >= end) break;
     INLINE_JSON_RE.lastIndex = i;
@@ -1325,18 +1288,21 @@ function trimSpacesTabsEnd(s, ls, le) {
   return le;
 }
 
-function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, broken) {
+function renderMarkdownInto(s, dirInfo, resolvedUrlsEsc, broken) {
+  const src = s.text;
+  const bodyStart = s.bodyStart;
   _mdDirInfo = dirInfo;
-  _mdSourcePath = sourcePath;
+  _mdSourcePath = s.path;
   _mdResolvedUrlsEsc = resolvedUrlsEsc;
   _mdBroken = broken;
-  _mdHasLsPs = LS_PS_RE.test(src);
+  _mdHasLsPs = s.hasLsPs;
   _mdIds.clear();
 
   const len = src.length;
   const toc = [];
   let excerpt = null;
-  const htmlParts = [];
+  const htmlParts = _mdHtmlParts;
+  htmlParts.length = 0;
   const jd = _mdJsonDirect;
   const inl = jd ? inlineSpanJson : inlineSpan;
   const hOpen = jd ? H_OPEN_J : H_OPEN;
@@ -1404,9 +1370,9 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
           ? '<pre><code>'
           : (jd ? '<pre><code class=\\"language-' + lang + '\\">' : '<pre><code class="language-' + lang + '">');
         if (bodyBegin === -1) {
-          htmlParts.push(openTag + (jd ? '</code></pre>\\n' : '</code></pre>\n'));
+          htmlParts.push(openTag, jd ? '</code></pre>\\n' : '</code></pre>\n');
         } else {
-          htmlParts.push(openTag + (jd ? escapeFenceJsonSpan(src, bodyBegin, bodyEnd) : escapeHtmlSpan(src, bodyBegin, bodyEnd)) + (jd ? '\\n</code></pre>\\n' : '\n</code></pre>\n'));
+          htmlParts.push(openTag, jd ? escapeFenceJsonSpan(src, bodyBegin, bodyEnd) : escapeHtmlSpan(src, bodyBegin, bodyEnd), jd ? '\\n</code></pre>\\n' : '\n</code></pre>\n');
         }
         continue;
       }
@@ -1420,7 +1386,7 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
         const hText = src.slice(hs, he);
         const id = uniqueSlug(slugify(hText), _mdIds);
         const inner = inl(hText, 0, hText.length);
-        htmlParts.push(hOpen[depth] + id + attrMid + inner + hClose[depth]);
+        htmlParts.push(hOpen[depth], id, attrMid, inner, hClose[depth]);
         if (depth === 2 || depth === 3) {
           toc.push(jd ? { level: depth, id, html: inner, $html: inner } : (_jsonMode ? { level: depth, id, html: inner, $html: jsonSliceFast(inner) } : { level: depth, id, html: inner }));
         }
@@ -1470,9 +1436,9 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       if (firstS === -1) {
         htmlParts.push(jd ? '<blockquote>\\n</blockquote>\\n' : '<blockquote>\n</blockquote>\n');
       } else if (parts === null) {
-        htmlParts.push((jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>') + inl(src, firstS, firstE) + (jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n'));
+        htmlParts.push(jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>', inl(src, firstS, firstE), jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n');
       } else {
-        htmlParts.push((jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>') + inl(parts, 0, parts.length) + (jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n'));
+        htmlParts.push(jd ? '<blockquote>\\n<p>' : '<blockquote>\n<p>', inl(parts, 0, parts.length), jd ? '</p>\\n</blockquote>\\n' : '</p>\n</blockquote>\n');
       }
       continue;
     }
@@ -1499,7 +1465,7 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
           const inner = itemJoined === null
             ? inl(src, itemS, itemE)
             : inl(itemJoined, 0, itemJoined.length);
-          htmlParts.push('<li>' + inner + liClose);
+          htmlParts.push('<li>', inner, liClose);
           itemS = trimSpacesTabsStart(src, isOrdered ? _ordTextStart : ls + 2, le);
           itemE = trimSpacesTabsEnd(src, itemS, le);
           itemJoined = null;
@@ -1532,44 +1498,91 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       const inner = itemJoined === null
         ? inl(src, itemS, itemE)
         : inl(itemJoined, 0, itemJoined.length);
-      htmlParts.push('<li>' + inner + (isOrdered ? olClose : ulClose));
+      htmlParts.push('<li>', inner, isOrdered ? olClose : ulClose);
       continue;
     }
     // Paragraph
-    const pStart0 = ls;
+    let pStart0 = ls;
     let pEnd0 = le;
+    let pTrimmed0 = false;
     let pJoined = null;
     if (c0 === 32 || c0 === 9 || src.charCodeAt(le - 1) === 32 || src.charCodeAt(le - 1) === 9) {
-      const ts0 = trimSpacesTabsStart(src, ls, le);
-      const te0 = trimSpacesTabsEnd(src, ts0, le);
-      pJoined = src.slice(ts0, te0);
+      pStart0 = trimSpacesTabsStart(src, ls, le);
+      pEnd0 = trimSpacesTabsEnd(src, pStart0, le);
+      pTrimmed0 = pEnd0 !== le;
     }
+    let paraDone = false;
     if (nl === -1) {
       hasLine = false;
+      paraDone = true;
+    } else if (!pTrimmed0) {
+      PARA_END_RE.lastIndex = nl;
+      if (!PARA_END_RE.test(src)) {
+        const endNoNl = src.charCodeAt(len - 1) === 10 ? len - 1 : len;
+        const lc = src.charCodeAt(endNoNl - 1);
+        pEnd0 = (lc === 32 || lc === 9) ? trimSpacesTabsEnd(src, pStart0, endNoNl) : endNoNl;
+        hasLine = false;
+        paraDone = true;
+      } else {
+        const hitEnd = PARA_END_RE.lastIndex;
+        const cPrev = src.charCodeAt(hitEnd - 2);
+        const cLast = src.charCodeAt(hitEnd - 1);
+        if (cPrev === 10 && cLast === 10) {
+          // Clean multi-line paragraph ended by \n\n!
+          pEnd0 = hitEnd - 2;
+          if (hitEnd >= len) {
+            hasLine = false;
+          } else {
+            ls = hitEnd;
+            nl = src.indexOf('\n', ls);
+            le = nl === -1 ? len : nl;
+          }
+          paraDone = true;
+        } else if (cPrev === 10) {
+          // \n followed by [ \t#`*-]: paragraph clean up to hitEnd - 2, inspect line at hitEnd - 1
+          pEnd0 = hitEnd - 2;
+          ls = hitEnd - 1;
+          nl = src.indexOf('\n', ls);
+          le = nl === -1 ? len : nl;
+        } else {
+          // [ \t]\n: trailing space on a continuation line; jump to that line
+          const lineStart = src.lastIndexOf('\n', hitEnd - 2);
+          pEnd0 = lineStart;
+          ls = lineStart + 1;
+          nl = hitEnd - 1;
+          le = nl;
+        }
+      }
     } else {
       ls = nl + 1;
       nl = src.indexOf('\n', ls);
       le = nl === -1 ? len : nl;
     }
-    while (hasLine) {
+    while (!paraDone && hasLine) {
       if (ls === le) break;
       const pc = src.charCodeAt(ls);
       if (pc > 96 || (pc >= 48 && pc <= 95)) {
         const lc = src.charCodeAt(le - 1);
-        if (lc !== 32 && lc !== 9) {
+        if (lc !== 32 && lc !== 9 && !pTrimmed0) {
           if (pJoined === null) pEnd0 = le;
           else pJoined += '\n' + src.slice(ls, le);
         } else {
-          const te = trimSpacesTabsEnd(src, ls, le);
+          const te = (lc === 32 || lc === 9) ? trimSpacesTabsEnd(src, ls, le) : le;
           if (pJoined === null) pJoined = src.slice(pStart0, pEnd0) + '\n' + src.slice(ls, te);
           else pJoined += '\n' + src.slice(ls, te);
         }
       } else {
-        if (endsParagraphLine(src, ls, le)) break;
-        const ts = (pc === 32 || pc === 9) ? trimSpacesTabsStart(src, ls, le) : ls;
+        let ts;
+        if (pc === 32 || pc === 9) {
+          ts = trimSpacesTabsStart(src, ls, le);
+          if (ts === le) break;
+        } else {
+          if (endsParagraphLine(src, ls, le)) break;
+          ts = ls;
+        }
         const lc = src.charCodeAt(le - 1);
         const te = (lc === 32 || lc === 9) ? trimSpacesTabsEnd(src, ts, le) : le;
-        if (pJoined === null && ts === ls && te === le) {
+        if (pJoined === null && !pTrimmed0 && ts === ls && te === le) {
           pEnd0 = le;
         } else if (pJoined === null) {
           pJoined = src.slice(pStart0, pEnd0) + '\n' + src.slice(ts, te);
@@ -1589,10 +1602,12 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       ? inl(src, pStart0, pEnd0)
       : inl(pJoined, 0, pJoined.length);
     if (excerpt === null) excerpt = inner;
-    htmlParts.push('<p>' + inner + pClose);
+    htmlParts.push('<p>', inner, pClose);
   }
 
-  return { html: htmlParts.join(''), toc, excerpt: excerpt === null ? '' : excerpt };
+  s.html = htmlParts.join('');
+  s.toc = toc;
+  s.excerpt = excerpt === null ? '' : excerpt;
 }
 
 // ---------------------------------------------------------------- templates
@@ -1786,7 +1801,6 @@ function jsonifyOps(ops) {
 }
 
 const PLAIN_KEY_RE = /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/;
-const NON_ASCII_RE = /[^\x00-\x7f]/;
 let _outBuf = null;
 let _outFd = -1;
 let _writeSync = null;
@@ -1795,12 +1809,11 @@ let _chunk = '';
 function flushChunk() {
   const clen = _chunk.length;
   if (clen === 0) return;
-  const hasNonAscii = NON_ASCII_RE.test(_chunk);
-  const maxBytes = hasNonAscii ? clen * 3 : clen;
+  const maxBytes = clen * 3;
   if (_outBuf === null || maxBytes > _outBuf.length) {
     _outBuf = Buffer.allocUnsafe(maxBytes > 2097152 ? maxBytes : 2097152);
   }
-  const n = _outBuf.write(_chunk, 0, hasNonAscii ? 'utf8' : 'latin1');
+  const n = _outBuf.utf8Write(_chunk, 0);
   let off = 0;
   while (off < n) off += _writeSync(_outFd, _outBuf, off, n - off);
   _chunk = '';
@@ -1889,7 +1902,7 @@ function execOps(ops, stack) {
         break;
       case 6: {
         const obj = stack[o.slot];
-        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+        if (obj !== null && typeof obj === 'object') {
           const v = obj[o.k1];
           if (typeof v === 'string') out += v;
           else if (typeof v === 'number') out += v;
@@ -1902,7 +1915,7 @@ function execOps(ops, stack) {
         const obj = stack[o.slot];
         if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
           const v1 = obj[o.k1];
-          if (v1 !== null && typeof v1 === 'object' && Object.hasOwn(v1, o.k2)) {
+          if (v1 !== null && typeof v1 === 'object') {
             const v = v1[o.k2];
             if (typeof v === 'string') out += v;
             else if (typeof v === 'number') out += v;
@@ -1966,6 +1979,7 @@ function execOps(ops, stack) {
             if (s === undefined) {
               stack[itemSlot] = item;
               s = execOps(bodyOps, stack);
+              FLAT_RE.test(s);
               cache.set(item, s);
             }
             out += s;
@@ -1973,9 +1987,13 @@ function execOps(ops, stack) {
         } else if (o.needsLoop) {
           const loopSlot = o.loopSlot;
           const lastIdx = xlen - 1;
+          const loopObj = { index: 1, first: true, last: false, length: xlen };
+          stack[loopSlot] = loopObj;
           for (let k = 0; k < xlen; k++) {
             stack[itemSlot] = xs[k];
-            stack[loopSlot] = { index: k + 1, first: k === 0, last: k === lastIdx, length: xlen };
+            loopObj.index = k + 1;
+            loopObj.first = k === 0;
+            loopObj.last = k === lastIdx;
             out += execOps(bodyOps, stack);
           }
         } else {
@@ -2039,8 +2057,8 @@ function specializeTemplate(
     if (isRaw) {
       if (!_jsonMode) {
         if (plen === 1) return { op: 5, slot };
-        if (plen === 2) return { op: 6, slot, k1: path[1] };
-        if (plen === 3) return { op: 10, slot, k1: path[1], k2: path[2] };
+        if (plen === 2) return { op: 11, slot, k1: path[1] };
+        if (plen === 3) return { op: 12, slot, k1: path[1], k2: path[2] };
         return { op: 7, slot, path, plen, k1: path[1], k2: path[2] };
       }
       if (plen >= 2) {
@@ -2188,8 +2206,8 @@ function specializeTemplate(
             let itemCache = null;
             const isItemPure = bodyInfo.minSlot >= itemSlot && !frame.usesLoop && !bodyInfo.touchesNonSiteRoot;
             if (isItemPure) {
-              // If body is a single include (e.g. {% include "card" %}), share cache across layouts!
-              if (n.body.length === 1 && n.body[0].kind === 5 && depth < INCLUDE_DEPTH) {
+              // If body is a single include (e.g. {% include "card" %}) with no enclosing frames, share cache across layouts!
+              if (frames.length === 0 && n.body.length === 1 && n.body[0].kind === 5 && depth < INCLUDE_DEPTH) {
                 const key = n.body[0].name + '\0' + n.name + '\0' + depth;
                 itemCache = sharedPureCaches.get(key);
                 if (itemCache === undefined) {
@@ -2363,7 +2381,7 @@ export function run(input, jsonMode = false) {
   }
 
   // 2. Sort input files by path in code-unit order
-  const rawFiles = input.files.slice().sort((x, y) => byCodeUnits(x.path, y.path));
+  const rawFiles = input.files.slice().sort((x, y) => (x.path < y.path ? -1 : x.path > y.path ? 1 : 0));
 
   // 3. Separate sources vs statics, normalize CR, parse front matter, filter refused/drafts
   const sources = [];
@@ -2383,7 +2401,8 @@ export function run(input, jsonMode = false) {
     if (text.indexOf('\r') !== -1) {
       text = text.replace(/\r\n?/g, '\n');
     }
-    const data = parseFrontMatter(text);
+    const hasLsPs = text.indexOf('\u2028') !== -1 || text.indexOf('\u2029') !== -1;
+    const data = parseFrontMatter(text, hasLsPs);
     if (data === null) {
       reportLines.push('refused ' + path + ': ' + _fmErr);
       continue;
@@ -2419,6 +2438,7 @@ export function run(input, jsonMode = false) {
       path,
       srcDir,
       text,
+      hasLsPs,
       bodyStart: _fmBodyStart,
       data,
       post: isPost,
@@ -2471,10 +2491,7 @@ export function run(input, jsonMode = false) {
       dirInfo = makeDirInfo(dirStr);
       dirInfoCache.set(dirStr, dirInfo);
     }
-    const md = renderMarkdown(s.text, s.bodyStart, dirInfo, s.path, resolvedUrlsEsc, broken);
-    s.html = md.html;
-    s.toc = md.toc;
-    s.excerpt = md.excerpt;
+    renderMarkdownInto(s, dirInfo, resolvedUrlsEsc, broken);
     if ((s.post && anyPostCardNeedsRM) || layoutNeedsReadingMinutes.get(s.layout)) {
       s.readingMinutes = readingMinutesOf(s.text, s.bodyStart);
     }

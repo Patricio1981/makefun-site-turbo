@@ -4,7 +4,7 @@ import { setFlagsFromString } from 'node:v8';
 // Tune V8 for short single-CPU batch execution in Node 22:
 // disable TurboFan, Maglev & background GC threads whose CPU overhead exceeds payback on a <200ms run.
 setFlagsFromString(
-  '--no-incremental-marking --no-turbofan --no-maglev --no-concurrent-recompilation --no-concurrent-marking --no-concurrent-sweeping --no-parallel-scavenge'
+  '--no-incremental-marking --no-turbofan --no-maglev --no-concurrent-recompilation --no-concurrent-marking --no-concurrent-sweeping --no-parallel-scavenge --always-sparkplug'
 );
 
 const { runBatchToFd } = (await import('./solve.js')) as {
