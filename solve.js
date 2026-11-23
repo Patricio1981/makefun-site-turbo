@@ -86,12 +86,28 @@ const ESC_RE = /[&<>"']/g;
 const ESC_TEST_RE = /[&<>"']/;
 const ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 const escCb = (c) => ESC_MAP[c];
+const JSON_ESC_TEST_RE = /["\\\x00-\x1f\ud800-\udfff]/;
+const FLAT_RE = /^/;
+let _jsonMode = false;
+
+function jsonSliceAlways(s) {
+  if (s.length === 0) return '';
+  FLAT_RE.test(s);
+  const q = JSON.stringify(s);
+  return q.slice(1, q.length - 1);
+}
+
+function jsonSliceFast(s) {
+  if (s.length === 0 || !JSON_ESC_TEST_RE.test(s)) return s;
+  const q = JSON.stringify(s);
+  return q.slice(1, q.length - 1);
+}
 const INLINE_RE = /[&<>"'\\`*\[]/g;
 const TICK_OR_ESC_RE = /[&<>"'`]/g;
 const BRACKET_OR_INLINE_RE = /[&<>"'\\`*[\]]/g;
 const WORD_200_RE = /\s*\S+(?:\s+\S+){199}/y;
 const WORD_1_RE = /\s*\S+/y;
-const WS_GLOBAL_RE = /\s/g;
+const CLOSE_PAREN_OR_WS_RE = /[)\s]/g;
 
 const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
@@ -955,11 +971,10 @@ function inlineSpan(s, start, end) {
             cleanLabel = false;
           }
           if (k !== -1 && k + 1 < end && s.charCodeAt(k + 1) === 40) {
-            const m = s.indexOf(')', k + 2);
-            if (m > k + 2 && m < end) {
-              WS_GLOBAL_RE.lastIndex = k + 2;
-              const hasWs = WS_GLOBAL_RE.test(s) && WS_GLOBAL_RE.lastIndex - 1 < m;
-              if (!hasWs) {
+            CLOSE_PAREN_OR_WS_RE.lastIndex = k + 2;
+            if (CLOSE_PAREN_OR_WS_RE.test(s)) {
+              const m = CLOSE_PAREN_OR_WS_RE.lastIndex - 1;
+              if (m > k + 2 && m < end && s.charCodeAt(m) === 41) {
                 if (last < i) out += s.slice(last, i);
                 const href = resolveLink(s, k + 2, m);
                 const label = cleanLabel ? s.slice(i + 1, k) : inlineSpan(s, i + 1, k);
@@ -1083,11 +1098,12 @@ function renderMarkdown(src, bodyStart, dirInfo, sourcePath, resolvedUrlsEsc, br
       if (depth !== 0) {
         const hs = _hStart;
         const he = _hEnd;
-        const id = uniqueSlug(slugify(src.slice(hs, he)), _mdIds);
-        const inner = inlineSpan(src, hs, he);
+        const hText = src.slice(hs, he);
+        const id = uniqueSlug(slugify(hText), _mdIds);
+        const inner = inlineSpan(hText, 0, hText.length);
         html += H_OPEN[depth] + id + '">' + inner + H_CLOSE[depth];
         if (depth === 2 || depth === 3) {
-          toc.push({ level: depth, id, html: inner });
+          toc.push(_jsonMode ? { level: depth, id, html: inner, $html: jsonSliceFast(inner) } : { level: depth, id, html: inner });
         }
         if (nl === -1) break;
         ls = nl + 1;
@@ -1424,6 +1440,56 @@ function renderRawValue(v) {
   return '';
 }
 
+function renderVarValueExec(v) {
+  const s = renderVarValue(v);
+  return _jsonMode ? jsonSliceFast(s) : s;
+}
+
+function renderRawValueExec(v) {
+  const s = renderRawValue(v);
+  return _jsonMode ? jsonSliceFast(s) : s;
+}
+
+function jsonifyOps(ops) {
+  for (let i = 0; i < ops.length; i++) {
+    const o = ops[i];
+    if (o.op === 0) {
+      o.text = jsonSliceAlways(o.text);
+    } else if (o.op === 8) {
+      jsonifyOps(o.thenOps);
+      if (o.elseOps !== null) jsonifyOps(o.elseOps);
+    } else if (o.op === 9) {
+      jsonifyOps(o.bodyOps);
+    }
+  }
+}
+
+const PLAIN_KEY_RE = /^[\x20-\x21\x23-\x5b\x5d-\x7e]*$/;
+let _outBuf = Buffer.allocUnsafe(2097152);
+let _outFd = -1;
+let _writeSync = null;
+let _chunk = '';
+
+function flushChunk() {
+  const clen = _chunk.length;
+  if (clen === 0) return;
+  FLAT_RE.test(_chunk);
+  const maxBytes = clen * 3;
+  if (maxBytes > _outBuf.length) _outBuf = Buffer.allocUnsafe(maxBytes);
+  const n = _outBuf.write(_chunk, 0, 'utf8');
+  _writeSync(_outFd, _outBuf, 0, n);
+  _chunk = '';
+}
+
+function emitEntry(k, vs, first, knownPlain) {
+  if (knownPlain || PLAIN_KEY_RE.test(k)) {
+    _chunk += (first ? '"' : ',"') + k + '":"' + vs + '"';
+  } else {
+    _chunk += (first ? '' : ',') + JSON.stringify(k) + ':"' + vs + '"';
+  }
+  if (_chunk.length >= 262144) flushChunk();
+}
+
 const ALWAYS_SAFE_HTML_KEYS = new Set([
   'date', 'date_long', 'slug', 'id',
   'reading_minutes', 'level', 'count', 'number', 'total',
@@ -1471,12 +1537,12 @@ function execOps(ops, stack) {
         out += o.text;
         break;
       case 1:
-        out += renderVarValue(stack[o.slot]);
+        out += renderVarValueExec(stack[o.slot]);
         break;
       case 2: {
         const obj = stack[o.slot];
         if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
-          out += renderVarValue(obj[o.k1]);
+          out += renderVarValueExec(obj[o.k1]);
         }
         break;
       }
@@ -1485,16 +1551,16 @@ function execOps(ops, stack) {
         if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
           const v1 = obj[o.k1];
           if (v1 !== null && typeof v1 === 'object' && Object.hasOwn(v1, o.k2)) {
-            out += renderVarValue(v1[o.k2]);
+            out += renderVarValueExec(v1[o.k2]);
           }
         }
         break;
       }
       case 4:
-        out += renderVarValue(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
+        out += renderVarValueExec(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
         break;
       case 5:
-        out += renderRawValue(stack[o.slot]);
+        out += renderRawValueExec(stack[o.slot]);
         break;
       case 6: {
         const obj = stack[o.slot];
@@ -1521,8 +1587,25 @@ function execOps(ops, stack) {
         }
         break;
       }
+      case 11: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          out += renderRawValueExec(obj[o.k1]);
+        }
+        break;
+      }
+      case 12: {
+        const obj = stack[o.slot];
+        if (obj !== null && typeof obj === 'object' && Object.hasOwn(obj, o.k1)) {
+          const v1 = obj[o.k1];
+          if (v1 !== null && typeof v1 === 'object' && Object.hasOwn(v1, o.k2)) {
+            out += renderRawValueExec(v1[o.k2]);
+          }
+        }
+        break;
+      }
       case 7:
-        out += renderRawValue(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
+        out += renderRawValueExec(evalPathSlot(stack, o.slot, o.path, o.plen, o.k1, o.k2));
         break;
       case 8: {
         let v;
@@ -1629,9 +1712,29 @@ function specializeTemplate(
   function makeVarOp(isRaw, slot, path) {
     const plen = path.length;
     if (isRaw) {
+      if (!_jsonMode) {
+        if (plen === 1) return { op: 5, slot };
+        if (plen === 2) return { op: 6, slot, k1: path[1] };
+        if (plen === 3) return { op: 10, slot, k1: path[1], k2: path[2] };
+        return { op: 7, slot, path, plen, k1: path[1], k2: path[2] };
+      }
+      if (plen >= 2) {
+        const last = path[plen - 1];
+        let mappedLast = null;
+        if (last === 'content') mappedLast = '$content';
+        else if (last === 'excerpt') mappedLast = '$excerpt';
+        else if (last === 'html') mappedLast = '$html';
+        else if (ALWAYS_SAFE_HTML_KEYS.has(last) || (baseSafe && URL_SAFE_HTML_KEYS.has(last))) {
+          mappedLast = last;
+        }
+        if (mappedLast !== null) {
+          if (plen === 2) return { op: 6, slot, k1: mappedLast };
+          if (plen === 3) return { op: 10, slot, k1: path[1], k2: mappedLast };
+        }
+      }
       if (plen === 1) return { op: 5, slot };
-      if (plen === 2) return { op: 6, slot, k1: path[1] };
-      if (plen === 3) return { op: 10, slot, k1: path[1], k2: path[2] };
+      if (plen === 2) return { op: 11, slot, k1: path[1] };
+      if (plen === 3) return { op: 12, slot, k1: path[1], k2: path[2] };
       return { op: 7, slot, path, plen, k1: path[1], k2: path[2] };
     }
     if (plen >= 2) {
@@ -1646,9 +1749,11 @@ function specializeTemplate(
       if (mappedLast !== null) {
         if (plen === 2) return { op: 6, slot, k1: mappedLast };
         if (plen === 3) return { op: 10, slot, k1: path[1], k2: mappedLast };
-        const p2 = path.slice();
-        p2[plen - 1] = mappedLast;
-        return { op: 7, slot, path: p2, plen, k1: p2[1], k2: p2[2] };
+        if (!_jsonMode) {
+          const p2 = path.slice();
+          p2[plen - 1] = mappedLast;
+          return { op: 7, slot, path: p2, plen, k1: p2[1], k2: p2[2] };
+        }
       }
     }
     if (plen === 1) return { op: 1, slot };
@@ -1824,6 +1929,7 @@ function specializeTemplate(
   const ops = [];
   const rootInfo = { minSlot: 1e9, touchesNonSiteRoot: false };
   compileList(nodes, 0, ops, rootInfo);
+  if (_jsonMode) jsonifyOps(ops);
   return { ops, slots: nextSlot };
 }
 
@@ -1857,7 +1963,8 @@ function dirOf(path) {
   return sl === -1 ? '' : path.slice(0, sl);
 }
 
-export function run(input) {
+export function run(input, jsonMode = false) {
+  _jsonMode = jsonMode;
   // 1. Parse templates in code-unit order of name
   const templates = new Map();
   const reportLines = [];
@@ -1876,7 +1983,7 @@ export function run(input) {
   let baseEnd = base.length;
   while (baseEnd > 0 && base.charCodeAt(baseEnd - 1) === 47) baseEnd--;
   if (baseEnd !== base.length) base = base.slice(0, baseEnd);
-  const baseSafe = escapeHtml(base) === base;
+  let baseSafe = escapeHtml(base) === base && (!jsonMode || !JSON_ESC_TEST_RE.test(base));
 
   // Check which layouts ever mention reading_minutes (skip word counting on layouts that don't!)
   const layoutNeedsReadingMinutes = new Map();
@@ -1944,9 +2051,13 @@ export function run(input) {
       reportLines.push('draft ' + path);
       continue;
     }
+    const srcDir = dirOf(path);
+    if (!isPost && baseSafe && srcDir !== '') {
+      if (ESC_TEST_RE.test(srcDir) || (jsonMode && JSON_ESC_TEST_RE.test(srcDir))) baseSafe = false;
+    }
     sources.push({
       path,
-      srcDir: dirOf(path),
+      srcDir,
       text,
       bodyStart: _fmBodyStart,
       data,
@@ -2007,6 +2118,7 @@ export function run(input) {
     if ((s.post && anyPostCardNeedsRM) || layoutNeedsReadingMinutes.get(s.layout)) {
       s.readingMinutes = readingMinutesOf(s.text, s.bodyStart);
     }
+    s.text = '';
   }
 
   // 6. Collections (posts newest first, then slug)
@@ -2052,7 +2164,8 @@ export function run(input) {
       let tag = tagBySlug.get(slug);
       if (tag === undefined) {
         const url = base + '/tags/' + slug + '/';
-        const nameEsc = escapeHtml(name);
+        const rawEsc = escapeHtml(name);
+        const nameEsc = jsonMode ? jsonSliceFast(rawEsc) : rawEsc;
         tag = { name, $name: nameEsc, slug, url, posts: [], link: { name, $name: nameEsc, slug, url } };
         tagBySlug.set(slug, tag);
       }
@@ -2090,7 +2203,8 @@ export function run(input) {
       if (existing !== undefined) {
         links.push(existing.link);
       } else {
-        links.push({ name, $name: escapeHtml(name), slug, url: '' });
+        const rawEsc = escapeHtml(name);
+        links.push({ name, $name: jsonMode ? jsonSliceFast(rawEsc) : rawEsc, slug, url: '' });
       }
     }
     s.tagLinks = links;
@@ -2106,15 +2220,18 @@ export function run(input) {
     const date = p.data.date;
     const title = p.data.title;
     const summary = p.data.summary !== undefined ? p.data.summary : '';
+    const rawTitleEsc = escapeHtml(title);
+    const rawSumEsc = summary === '' ? '' : escapeHtml(summary);
     p.card = {
       title,
-      $title: escapeHtml(title),
+      $title: jsonMode ? jsonSliceFast(rawTitleEsc) : rawTitleEsc,
       url: p.url,
       date,
       date_long: longDate(date),
       summary,
-      $summary: summary === '' ? '' : escapeHtml(summary),
+      $summary: jsonMode ? jsonSliceFast(rawSumEsc) : rawSumEsc,
       excerpt: p.excerpt,
+      $excerpt: jsonMode ? jsonSliceAlways(p.excerpt) : p.excerpt,
       reading_minutes: p.readingMinutes,
       tags: p.tagLinks,
     };
@@ -2122,7 +2239,8 @@ export function run(input) {
 
   // Build shared constant root values
   const siteTitle = input.site.title;
-  const siteObj = { title: siteTitle, $title: escapeHtml(siteTitle), base_url: base };
+  const rawSiteTitleEsc = escapeHtml(siteTitle);
+  const siteObj = { title: siteTitle, $title: jsonMode ? jsonSliceFast(rawSiteTitleEsc) : rawSiteTitleEsc, base_url: base };
   const allTags = new Array(sortedTags.length);
   for (let i = 0; i < sortedTags.length; i++) {
     const t = sortedTags[i];
@@ -2173,7 +2291,6 @@ export function run(input) {
   }
 
   // 8. Render layouts
-  const output = {};
   const stack = new Array(32);
   const pageObj = {
     title: '',
@@ -2184,16 +2301,186 @@ export function run(input) {
     summary: '',
     $summary: '',
     excerpt: '',
+    $excerpt: '',
     reading_minutes: 1,
     tags: null,
     slug: '',
     content: '',
+    $content: '',
     toc: null,
     newer: null,
     older: null,
     is_post: false,
   };
 
+  if (jsonMode) {
+    const builtPaths = statics.length > 0 ? new Set() : null;
+    let firstEntry = true;
+
+    for (let i = 0; i < sources.length; i++) {
+      const s = sources[i];
+      const compiled = getPageLayout(s.layout);
+      if (s.post) {
+        const c = s.card;
+        pageObj.title = c.title;
+        pageObj.$title = c.$title;
+        pageObj.url = c.url;
+        pageObj.date = c.date;
+        pageObj.date_long = c.date_long;
+        pageObj.summary = c.summary;
+        pageObj.$summary = c.$summary;
+        pageObj.excerpt = c.excerpt;
+        pageObj.$excerpt = c.$excerpt;
+        pageObj.reading_minutes = c.reading_minutes;
+        pageObj.tags = c.tags;
+        pageObj.slug = s.slug;
+        pageObj.content = s.html;
+        pageObj.$content = jsonSliceAlways(s.html);
+        pageObj.toc = s.toc;
+        pageObj.newer = linkOfPost(s.newer);
+        pageObj.older = linkOfPost(s.older);
+        pageObj.is_post = true;
+      } else {
+        const d = s.data.date;
+        const title = s.data.title;
+        const summary = s.data.summary !== undefined ? s.data.summary : '';
+        const rawTitleEsc = escapeHtml(title);
+        const rawSumEsc = summary === '' ? '' : escapeHtml(summary);
+        pageObj.title = title;
+        pageObj.$title = jsonSliceFast(rawTitleEsc);
+        pageObj.url = s.url;
+        pageObj.date = d !== undefined ? d : '';
+        pageObj.date_long = d !== undefined ? longDate(d) : '';
+        pageObj.summary = summary;
+        pageObj.$summary = jsonSliceFast(rawSumEsc);
+        pageObj.excerpt = s.excerpt;
+        pageObj.$excerpt = jsonSliceFast(s.excerpt);
+        pageObj.reading_minutes = s.readingMinutes;
+        pageObj.tags = s.tagLinks;
+        pageObj.slug = s.slug;
+        pageObj.content = s.html;
+        pageObj.$content = jsonSliceAlways(s.html);
+        pageObj.toc = s.toc;
+        pageObj.newer = null;
+        pageObj.older = null;
+        pageObj.is_post = false;
+      }
+      stack[0] = pageObj;
+      const outPath = s.outDir + '/index.html';
+      if (builtPaths !== null) builtPaths.add(outPath);
+      emitEntry(outPath, execOps(compiled.ops, stack), firstEntry, baseSafe);
+      firstEntry = false;
+      s.html = '';
+    }
+
+    const indexTpl = templates.get('index');
+    if (indexTpl !== undefined) {
+      const compiledIndex = specializeTemplate(
+        indexTpl,
+        templates,
+        constRoot,
+        new Map([['posts', 0], ['pager', 1]]),
+        new Set(['pager']),
+        sharedPureCaches,
+        baseSafe,
+        sitePureIncludeCache
+      );
+      const per = input.site.per_page;
+      const totalPages = Math.max(1, Math.ceil(posts.length / per));
+      const pagerObj = { number: 1, total: totalPages, url: '', newer_url: '', older_url: '' };
+      for (let k = 1; k <= totalPages; k++) {
+        const start = (k - 1) * per;
+        const end = Math.min(posts.length, k * per);
+        const sliceCards = new Array(end - start);
+        for (let j = start; j < end; j++) sliceCards[j - start] = posts[j].card;
+        pagerObj.number = k;
+        pagerObj.url = k === 1 ? base + '/' : base + '/page/' + k + '/';
+        pagerObj.newer_url = k === 1 ? '' : (k === 2 ? base + '/' : base + '/page/' + (k - 1) + '/');
+        pagerObj.older_url = k === totalPages ? '' : base + '/page/' + (k + 1) + '/';
+        stack[0] = sliceCards;
+        stack[1] = pagerObj;
+        const outPath = k === 1 ? 'index.html' : 'page/' + k + '/index.html';
+        if (builtPaths !== null) builtPaths.add(outPath);
+        emitEntry(outPath, execOps(compiledIndex.ops, stack), firstEntry, true);
+        firstEntry = false;
+      }
+    }
+
+    const tagTpl = templates.get('tag');
+    if (tagTpl !== undefined) {
+      const compiledTag = specializeTemplate(
+        tagTpl,
+        templates,
+        constRoot,
+        new Map([['tag', 0]]),
+        new Set(['tag']),
+        sharedPureCaches,
+        baseSafe,
+        sitePureIncludeCache
+      );
+      const tagObj = { name: '', $name: '', slug: '', url: '', count: 0, posts: null };
+      for (let i = 0; i < sortedTags.length; i++) {
+        const t = sortedTags[i];
+        const tPosts = t.posts;
+        const cards = new Array(tPosts.length);
+        for (let j = 0; j < tPosts.length; j++) cards[j] = tPosts[j].card;
+        tagObj.name = t.name;
+        tagObj.$name = t.$name;
+        tagObj.slug = t.slug;
+        tagObj.url = t.url;
+        tagObj.count = tPosts.length;
+        tagObj.posts = cards;
+        stack[0] = tagObj;
+        const outPath = 'tags/' + t.slug + '/index.html';
+        if (builtPaths !== null) builtPaths.add(outPath);
+        emitEntry(outPath, execOps(compiledTag.ops, stack), firstEntry, true);
+        firstEntry = false;
+      }
+    }
+
+    const tagsTpl = templates.get('tags');
+    if (tagsTpl !== undefined) {
+      const compiledTags = specializeTemplate(
+        tagsTpl,
+        templates,
+        constRoot,
+        new Map(),
+        new Set(),
+        sharedPureCaches,
+        baseSafe,
+        sitePureIncludeCache
+      );
+      const outPath = 'tags/index.html';
+      if (builtPaths !== null) builtPaths.add(outPath);
+      emitEntry(outPath, execOps(compiledTags.ops, stack), firstEntry, true);
+      firstEntry = false;
+    }
+
+    for (let i = 0; i < statics.length; i++) {
+      const f = statics[i];
+      if (builtPaths.has(f.path)) {
+        reportLines.push('shadowed ' + f.path + ': a built page has its path');
+      } else {
+        builtPaths.add(f.path);
+        emitEntry(f.path, jsonSliceAlways(f.content), firstEntry, false);
+        firstEntry = false;
+      }
+    }
+
+    if (broken.size > 0) {
+      for (const line of broken) reportLines.push(line);
+    }
+    reportLines.sort(byCodeUnits);
+    reportLines.push(
+      'built ' + pageCount + ' pages, ' + posts.length + ' posts, ' + sortedTags.length + ' tags and ' + statics.length + ' static files'
+    );
+    const repStr = reportLines.join('\n') + '\n';
+    emitEntry(REPORT_FILE, jsonSliceAlways(repStr), firstEntry, true);
+    _jsonMode = false;
+    return null;
+  }
+
+  const output = {};
   for (let i = 0; i < sources.length; i++) {
     const s = sources[i];
     const compiled = getPageLayout(s.layout);
@@ -2207,10 +2494,12 @@ export function run(input) {
       pageObj.summary = c.summary;
       pageObj.$summary = c.$summary;
       pageObj.excerpt = c.excerpt;
+      pageObj.$excerpt = c.$excerpt;
       pageObj.reading_minutes = c.reading_minutes;
       pageObj.tags = c.tags;
       pageObj.slug = s.slug;
       pageObj.content = s.html;
+      pageObj.$content = s.html;
       pageObj.toc = s.toc;
       pageObj.newer = linkOfPost(s.newer);
       pageObj.older = linkOfPost(s.older);
@@ -2219,18 +2508,22 @@ export function run(input) {
       const d = s.data.date;
       const title = s.data.title;
       const summary = s.data.summary !== undefined ? s.data.summary : '';
+      const rawTitleEsc = escapeHtml(title);
+      const rawSumEsc = summary === '' ? '' : escapeHtml(summary);
       pageObj.title = title;
-      pageObj.$title = escapeHtml(title);
+      pageObj.$title = rawTitleEsc;
       pageObj.url = s.url;
       pageObj.date = d !== undefined ? d : '';
       pageObj.date_long = d !== undefined ? longDate(d) : '';
       pageObj.summary = summary;
-      pageObj.$summary = summary === '' ? '' : escapeHtml(summary);
+      pageObj.$summary = rawSumEsc;
       pageObj.excerpt = s.excerpt;
+      pageObj.$excerpt = s.excerpt;
       pageObj.reading_minutes = s.readingMinutes;
       pageObj.tags = s.tagLinks;
       pageObj.slug = s.slug;
       pageObj.content = s.html;
+      pageObj.$content = s.html;
       pageObj.toc = s.toc;
       pageObj.newer = null;
       pageObj.older = null;
@@ -2238,6 +2531,7 @@ export function run(input) {
     }
     stack[0] = pageObj;
     output[s.outDir + '/index.html'] = execOps(compiled.ops, stack);
+    s.html = '';
   }
 
   // Index pages
@@ -2335,7 +2629,24 @@ export function run(input) {
   reportLines.push(
     'built ' + pageCount + ' pages, ' + posts.length + ' posts, ' + sortedTags.length + ' tags and ' + statics.length + ' static files'
   );
-  output[REPORT_FILE] = reportLines.join('\n') + '\n';
+  const repStr = reportLines.join('\n') + '\n';
+  output[REPORT_FILE] = repStr;
+  _jsonMode = false;
 
   return output;
+}
+
+export function runBatchToFd(cases, fd, writeSyncFn) {
+  _outFd = fd;
+  _writeSync = writeSyncFn;
+  _chunk = '[';
+  for (let i = 0; i < cases.length; i++) {
+    if (i > 0) _chunk += ',{';
+    else _chunk += '{';
+    run(cases[i].input, true);
+    cases[i] = null;
+    _chunk += '}';
+  }
+  _chunk += ']';
+  flushChunk();
 }
